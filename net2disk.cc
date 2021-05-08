@@ -7,6 +7,9 @@
 #include <string>
 #include <vector>
 
+#include <condition_variable>
+#include <mutex>
+
 #include <assert.h>
 #include <stdlib.h>      // atoi, ...
 #include <string.h>      // memset, ...
@@ -142,6 +145,12 @@ Args::Args(int argc, char **argv)
     }
 }
 
+struct Spawn_Notifier {
+    std::condition_variable cv;
+    std::mutex mutex;
+    bool initialized { false };
+};
+
 struct Reader_Args : public Args {
     Reader_Args();
     Reader_Args(const Args &o);
@@ -154,6 +163,7 @@ struct Reader_Args : public Args {
     unsigned core{0};
 
     pthread_t thread_id {0};
+    Spawn_Notifier *notifier {nullptr};
 
     // XXX move to args
     unsigned spin_rounds {100};
@@ -497,6 +507,13 @@ void Reader::main()
         ixxx::linux::epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev);
     }
 
+    // make sure that packet sockets are created in a deterministic order
+    {
+        std::lock_guard<std::mutex> lock(args.notifier->mutex);
+        args.notifier->initialized = true;
+    }
+    args.notifier->cv.notify_one();
+
     ixxx::util::FD tfd { ixxx::linux::timerfd_create(CLOCK_REALTIME, 0) };
     {
         struct itimerspec spec = {
@@ -645,11 +662,13 @@ static void spawn_readers(const Args &args, std::vector<Reader_Args> &ras)
 {
     unsigned i = 0;
     ras.resize(args.cores.size());
+    Spawn_Notifier sn;
     for (auto core : args.cores) {
         ras[i] = args;
         auto &a = ras[i];
 
         a.set_core(core, i);
+        a.notifier = &sn;
 
         ixxx::util::Pthread_Attr attr;
         {
@@ -661,6 +680,14 @@ static void spawn_readers(const Args &args, std::vector<Reader_Args> &ras)
 
         ixxx::posix::pthread_create(&a.thread_id, attr.ibute(), reader_main,
                 const_cast<void*>(static_cast<const void*>(&a)));
+
+        // wait until the reader has joined the fanout-group such that the
+        // group ordering is deterministic
+        {
+            std::unique_lock<std::mutex> lock(sn.mutex);
+            sn.cv.wait(lock, [&sn]{ return sn.initialized; });
+            sn.initialized = false;
+        }
 
         ++i;
     }

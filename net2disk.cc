@@ -205,6 +205,12 @@ Rx_Ring::Rx_Ring(int fd, unsigned block_size, unsigned frame_size, unsigned bloc
     struct tpacket_req3 req = {
         .tp_block_size = block_size,
         .tp_block_nr   = blocks,
+        // with TPACKET_V3, when receiving packets, the kernel places variable
+        // sized frames into the buffer (cf. tp_next_offset); we still
+        // set tp_frame_size+tp_frame_nr here since the code in
+        // https://elixir.bootlin.com/linux/latest/source/net/packet/af_packet.c
+        // still checks it and it looks like the tp_frame_size is used as max frame size
+        // in some places
         .tp_frame_size = frame_size,
         .tp_frame_nr   = blocks * block_size / frame_size,
         // partially filled block is 'retired' from the kernel after X ms:

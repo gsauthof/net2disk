@@ -347,17 +347,6 @@ void Reader::map_files()
 
     rename_file();
 }
-void Reader::switch_file()
-{
-    ixxx::posix::linkat(tmp_dir_fd, filenames[file_idx],
-            new_dir_fd, filenames[file_idx], 0);
-    file_idx = (file_idx + 1) % files.size();
-
-    slice.first  = files[file_idx].begin();
-    slice.second = files[file_idx].end();
-
-    rename_file();
-}
 
 struct PCAP_Header {
     uint32_t magic;
@@ -382,6 +371,22 @@ struct PCAP_Pkt_Header {
     uint32_t snaplen;
     uint32_t len;
 };
+
+void Reader::switch_file()
+{
+    ixxx::posix::linkat(tmp_dir_fd, filenames[file_idx],
+            new_dir_fd, filenames[file_idx], 0);
+    file_idx = (file_idx + 1) % files.size();
+
+    slice.first  = files[file_idx].begin();
+    slice.second = files[file_idx].end();
+
+    PCAP_Header h(default_pcap_header);
+    h.snaplen = args.snaplen;
+    slice.first = static_cast<unsigned char *>(mempcpy(slice.first, &h, sizeof h));
+
+    rename_file();
+}
 
 void Reader::write_packet(const unsigned char *begin, unsigned snaplen, unsigned len,
         unsigned sec, unsigned nsec)

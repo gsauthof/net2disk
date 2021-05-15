@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include <chrono>              // chrono_literals
 #include <condition_variable>
 #include <mutex>
 
@@ -696,7 +697,10 @@ static void spawn_readers(const Args &args, std::vector<Reader_Args> &ras)
         // group ordering is deterministic
         {
             std::unique_lock<std::mutex> lock(sn.mutex);
-            sn.cv.wait(lock, [&sn]{ return sn.initialized; });
+            using namespace std::chrono_literals;
+            bool success = sn.cv.wait_for(lock, 3s, [&sn]{ return sn.initialized; });
+            if (!success)
+                throw std::runtime_error("reader thread start timed out");
             sn.initialized = false;
         }
 

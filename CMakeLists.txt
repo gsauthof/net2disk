@@ -23,3 +23,20 @@ target_link_libraries(net2disk
     ixxx_static
     Threads::Threads
     )
+
+
+
+add_executable(test_aio
+    test_aio.cc
+    aio_device.cc
+    )
+set_property(TARGET test_aio PROPERTY INCLUDE_DIRECTORIES
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/libixxx
+    ${CMAKE_SOURCE_DIR}/libixxxutil
+    )
+target_link_libraries(test_aio
+    ixxxutil_static
+    ixxx_static
+    Threads::Threads
+    )

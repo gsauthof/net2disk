@@ -34,7 +34,7 @@ class Aio_Device {
         ~Aio_Device();
 
         // precondition: n <= slice_size_
-        void write(unsigned char *v, size_t n)
+        void write(const unsigned char *v, size_t n)
         {
             // since pointer comparisons beyond 1 past the end
             // yield undefined behaviour ...

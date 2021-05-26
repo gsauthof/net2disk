@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <charconv> // to_chars
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -36,6 +37,29 @@
 #include <ixxx/util.hh>
 #include <ixxx/pthread_util.hh>
 #include <ixxx/sys_error.hh>
+
+#include "aio_device.hh"
+#include "pcap.hh"
+
+
+enum class Writer {
+    MMAP,
+    AIO
+};
+
+#ifndef NET2DISK_WRITER
+#define NET2DISK_WRITER 1
+#endif
+
+static constexpr Writer writer =
+#if NET2DISK_WRITER == 0
+    Writer::MAP
+#elif NET2DISK_WRITER == 1
+    Writer::AIO
+#else
+#error "unknown NET2DISK_WRITER choice"
+#endif
+    ;
 
 struct Args {
 
@@ -156,8 +180,9 @@ struct Reader_Args : public Args {
     Reader_Args();
     Reader_Args(const Args &o);
 
-    std::string new_dir { "/KAPPES/" };
-    std::string tmp_dir { "/KAPPES/" };
+    std::string new_dir  { "/KAPPES/" };
+    std::string tmp_dir  { "/KAPPES/" };
+    std::string dev_path { "/KAPPES/dev" };
 
 
     unsigned index{0};
@@ -183,6 +208,8 @@ void Reader_Args::set_core(unsigned core, unsigned index)
 
     new_dir = base_dir + '/' + std::to_string(index) + "/new";
     tmp_dir = base_dir + '/' + std::to_string(index) + "/tmp";
+
+    dev_path = base_dir + '/' + std::to_string(index) + "/dev";
 }
 
 
@@ -241,10 +268,16 @@ struct Reader {
 
     ixxx::util::FD tmp_dir_fd;
     ixxx::util::FD new_dir_fd;
+
     std::vector<ixxx::util::MMap> files;
     std::vector<std::string> filenames;
     unsigned file_idx {0};
     std::pair<unsigned char*, unsigned char *> slice { nullptr, nullptr };
+
+
+    std::unique_ptr<Aio_Device> aio_dev;
+    size_t last_sec {0};
+    size_t last_off {0};
 
 
     size_t bytes_captured {0};
@@ -256,9 +289,15 @@ struct Reader {
     int mk_packet_socket();
 
     void rename_file();
+
     void map_files();
     void switch_file();
+
+    void setup_aio_dev();
+    void reference_chunk();
+
     void terminate();
+
     void print_stats(int fd);
     void print_delta_stats(int fd);
 
@@ -349,29 +388,13 @@ void Reader::map_files()
     rename_file();
 }
 
-struct PCAP_Header {
-    uint32_t magic;
-    uint16_t major;
-    uint16_t minor;
-    int32_t timezone;
-    uint32_t sigfigs;
-    uint32_t snaplen;
-    uint32_t network;
-};
-static const PCAP_Header default_pcap_header = {
-    .magic = 0xa1b23c4d, // i.e. ns resolution, use 0xa1b2c3d4 for us resolution
-    .major = 2, // PCAP format version
-    .minor = 4,
-    .snaplen = 1522, // maximum captured packet size
-    .network = 1 // ethernet
-};
+void Reader::setup_aio_dev()
+{
+    size_t slice_size = 64lu * 1024;
+    aio_dev.reset(new Aio_Device(args.dev_path.c_str(),
+                slice_size, 1024lu * 1024 * 1024 / slice_size));
+}
 
-struct PCAP_Pkt_Header {
-    uint32_t sec;
-    uint32_t nsec; // or usec in old format
-    uint32_t snaplen;
-    uint32_t len;
-};
 
 void Reader::switch_file()
 {
@@ -389,6 +412,32 @@ void Reader::switch_file()
     rename_file();
 }
 
+void Reader::reference_chunk()
+{
+    struct tm g;
+    time_t t = last_sec;
+    ixxx::posix::gmtime_r(&t, &g);
+    char fn[4+2*2+2 + 1 +  3*2+2 + 2  + 2*20 + 1 + 1] = {0};
+    ixxx::ansi::strftime(fn, sizeof fn, "%FT%TZ_", &g);
+    char *p = fn + 4+2*2+2 + 1 +  3*2+2 + 2;
+    auto r = std::to_chars(p, fn+sizeof fn-1, last_off);
+    if (r.ec != std::errc())
+        throw std::runtime_error("couldn't convert last offset");
+
+    p = r.ptr;
+    *p = '-';
+    ++p;
+    last_off = aio_dev->byte_offset();
+    r = std::to_chars(p, fn+sizeof fn-1, last_off);
+    if (r.ec != std::errc())
+        throw std::runtime_error("couldn't convert byte offset");
+    p = r.ptr;
+    *p = 0;
+
+    int x = ixxx::posix::openat(new_dir_fd, fn, O_CREAT | O_DIRECT | O_WRONLY, 0644);
+    ixxx::posix::close(x);
+}
+
 void Reader::write_packet(const unsigned char *begin, unsigned snaplen, unsigned len,
         unsigned sec, unsigned nsec)
 {
@@ -399,16 +448,28 @@ void Reader::write_packet(const unsigned char *begin, unsigned snaplen, unsigned
         .len = len
     };
 
-    unsigned char *e = slice.first + sizeof h + snaplen;
-    
-    if (e > slice.second) {
-        memset(slice.first, 0, slice.second - slice.first);
-        switch_file();
-    }
-    assert(size_t(slice.second - slice.first) >= sizeof h + snaplen);
+    if (writer == Writer::MMAP) {
+        unsigned char *e = slice.first + sizeof h + snaplen;
 
-    slice.first = static_cast<unsigned char*>(mempcpy(slice.first, &h, sizeof h));
-    slice.first = static_cast<unsigned char*>(mempcpy(slice.first, begin, snaplen));
+        if (e > slice.second) {
+            memset(slice.first, 0, slice.second - slice.first);
+            switch_file();
+        }
+        assert(size_t(slice.second - slice.first) >= sizeof h + snaplen);
+
+        slice.first = static_cast<unsigned char*>(mempcpy(slice.first, &h, sizeof h));
+        slice.first = static_cast<unsigned char*>(mempcpy(slice.first, begin, snaplen));
+
+    } else if (writer == Writer::AIO) {
+        if (sec >= last_sec + 60) {
+            if (last_sec)
+                reference_chunk();
+            last_sec = sec / 60 * 60;
+        }
+
+        aio_dev->write(reinterpret_cast<unsigned char*>(&h), sizeof h);
+        aio_dev->write(begin, snaplen);
+    }
 
     bytes_captured += snaplen;
 }
@@ -447,11 +508,16 @@ void Reader::traverse_blocks()
 
 void Reader::terminate()
 {
-    ixxx::posix::truncate(args.tmp_dir + '/' + filenames[file_idx],
-            slice.first - files[file_idx].begin());
+    if (writer == Writer::MMAP) {
+        ixxx::posix::truncate(args.tmp_dir + '/' + filenames[file_idx],
+                slice.first - files[file_idx].begin());
 
-    ixxx::posix::linkat(tmp_dir_fd, filenames[file_idx],
-            new_dir_fd, filenames[file_idx], 0);
+        ixxx::posix::linkat(tmp_dir_fd, filenames[file_idx],
+                new_dir_fd, filenames[file_idx], 0);
+    } else {
+        reference_chunk();
+        aio_dev->close();
+    }
 }
 
 void Reader::print_stats(int fd)
@@ -502,9 +568,17 @@ void Reader::print_delta_stats(int fd)
         << freeze_s << " freeze_q_cnt/s (" << freeze << " per period)\n";
 }
 
+
 void Reader::main()
 {
-    map_files();
+    switch (writer) {
+        case Writer::MMAP:
+          map_files();
+          break;
+        case Writer::AIO:
+          setup_aio_dev();
+          break;
+    }
     new_dir_fd = ixxx::util::FD{ ixxx::posix::open(args.new_dir, O_RDONLY | O_PATH | O_DIRECTORY) };
 
     ixxx::util::FD efd { ixxx::linux::epoll_create1(0) };
@@ -542,9 +616,11 @@ void Reader::main()
         ixxx::linux::epoll_ctl(efd, EPOLL_CTL_ADD, tfd, &ev);
     }
 
-    PCAP_Header h(default_pcap_header);
-    h.snaplen = args.snaplen;
-    slice.first = static_cast<unsigned char *>(mempcpy(slice.first, &h, sizeof h));
+    if (writer == Writer::MMAP) {
+        PCAP_Header h(default_pcap_header);
+        h.snaplen = args.snaplen;
+        slice.first = static_cast<unsigned char *>(mempcpy(slice.first, &h, sizeof h));
+    }
 
 
     struct epoll_event evs[3];
@@ -649,6 +725,48 @@ static void setup_files(const std::string &base_dir, size_t file_size, size_t fi
     }
 }
 
+static void setup_aio(const std::string &base_dir, size_t no_readers)
+{
+    std::string t { base_dir };
+    t += '/';
+    auto n = t.size();
+    for (size_t i = 0; i < no_readers; ++i) {
+        t += std::to_string(i);
+
+        try {
+            ixxx::posix::mkdir(t, 0775);
+        } catch (const ixxx::mkdir_error &e) {
+            if (e.code() != EEXIST)
+                throw;
+        }
+
+        t += '/';
+        auto m = t.size();
+        for (auto x : { "/tmp", "/new" }) {
+            t += x;
+            try {
+                ixxx::posix::mkdir(t, 0775);
+            } catch (const ixxx::mkdir_error &e) {
+                if (e.code() != EEXIST)
+                    throw;
+            }
+            t.resize(m);
+        }
+
+        t += "/dev";
+        try {
+            struct stat st;
+            ixxx::posix::stat(t, &st);
+        } catch (const ixxx::stat_error &e) {
+            if (e.code() == ENOENT)
+                throw std::runtime_error("dev link is missing in reader director");
+            throw;
+        }
+
+        t.resize(n);
+    }
+}
+
 static void *reader_main(void *v)
 {
     const Reader_Args *ra = static_cast<Reader_Args*>(v);
@@ -712,7 +830,14 @@ static void spawn_readers(const Args &args, std::vector<Reader_Args> &ras)
 static int mainP(int argc, char **argv)
 {
     Args args(argc, argv);
-    setup_files(args.base_dir, args.file_size, args.file_count, args.cores.size());
+    switch (writer) {
+        case Writer::MMAP:
+            setup_files(args.base_dir, args.file_size, args.file_count, args.cores.size());
+            break;
+        case Writer::AIO:
+            setup_aio(args.base_dir, args.cores.size());
+            break;
+    }
 
     ixxx::util::FD efd { ixxx::linux::eventfd(0, EFD_SEMAPHORE) };
     args.efd = efd.get();

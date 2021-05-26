@@ -12,6 +12,8 @@ find_package(Threads REQUIRED)
 
 add_executable(net2disk
     net2disk.cc
+    pcap.cc
+    aio_device.cc
     )
 set_property(TARGET net2disk PROPERTY INCLUDE_DIRECTORIES
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -40,3 +42,18 @@ target_link_libraries(test_aio
     ixxx_static
     Threads::Threads
     )
+
+add_executable(dev2pcap
+    dev2pcap.cc
+    pcap.cc
+    )
+set_property(TARGET dev2pcap PROPERTY INCLUDE_DIRECTORIES
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/libixxx
+    ${CMAKE_SOURCE_DIR}/libixxxutil
+    )
+target_link_libraries(dev2pcap
+    ixxxutil_static
+    ixxx_static
+    )
+

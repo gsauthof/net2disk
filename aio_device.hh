@@ -144,12 +144,14 @@ class Aio_Device {
                 off_ = start_off_;
 
             slice_idx_ = (slice_idx_ + 1) % slice_count_;
+            assert(fresh_size_ >= slice_size_);
             fresh_size_ -= slice_size_;
             if (slice_idx_) {
                 fresh_ += slice_size_;
             } else {
                 assert(!fresh_size_);
                 fresh_ = begin_;
+                p_ = begin_;
             }
         }
 

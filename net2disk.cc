@@ -477,15 +477,36 @@ void Reader::write_packet(const unsigned char *begin, unsigned snaplen, unsigned
 void Reader::traverse_blocks()
 {
     for (unsigned char *p : ring.block_addrs) {
-        tpacket_block_desc * __attribute__((__may_alias__)) desc = (tpacket_block_desc*)p;
-        if (__atomic_load_n(&desc->hdr.bh1.block_status, __ATOMIC_ACQUIRE) & TP_STATUS_USER) {
-            uint32_t n = __atomic_load_n(&desc->hdr.bh1.num_pkts, __ATOMIC_ACQUIRE);
-            uint32_t off = __atomic_load_n(&desc->hdr.bh1.offset_to_first_pkt, __ATOMIC_ACQUIRE);
+        // using this as a barrier operation to create objects - like the proposed std::bless()
+        // We do this such that we implicitly re-create tpacket3_hdr objects on each traverse_blocks()
+        // invocation since the kernel re-uses each block and on each reuse the new tpacket3_hdr
+        // might overlay partly.
+        // Thus, an overly analytic compiler might deduce such created objects are impossible
+        // which would make the program's behavior undefined.
+        // cf. http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p0593r5.html#when-to-create-objects
+        new (p) std::byte[ring.block_size];
+        // NB: for the implicit creation of tpacket_block_desc objects alone we don't need the
+        // above barrier because mmap() likely is implementation-defined as creating objects.
 
-            tpacket3_hdr * __attribute__((__may_alias__)) pkt = (tpacket3_hdr*)(p + off);
+        // exploiting C++'s implicit object creation rules
+        // (which are similar to C's effective type rules)
+        // cf. https://en.cppreference.com/w/cpp/language/object
+        // cf. https://en.cppreference.com/w/c/language/object#Effective_type
+        tpacket_block_desc *desc = reinterpret_cast<tpacket_block_desc*>(p);
+        if (__atomic_load_n(&desc->hdr.bh1.block_status, __ATOMIC_ACQUIRE) & TP_STATUS_USER) {
+            // not using atomic loads for the next two fields because the kernel should sequence
+            // the block_status write before the other field writes
+            uint32_t n   = desc->hdr.bh1.num_pkts;
+            uint32_t off = desc->hdr.bh1.offset_to_first_pkt;
+
+            unsigned char *b = p + off;
 
             for (unsigned i = 0; i < n;  ++i) {
-                unsigned char *b = (unsigned char*)pkt;
+                // C++ implicit object creation ok here because of the above barrier
+                tpacket3_hdr *pkt = reinterpret_cast<tpacket3_hdr*>(b);
+                // otherwise, we would need to do something like this:
+                // tpacket3_hdr pkt;
+                // memcpy(&pkt, b, sizeof pkt);
 
                 // NB: tp_snaplen is the distance from tp_mac to packed end
                 // NB: [tp_mac .. tp_net] is the ethernet header which is
@@ -497,7 +518,7 @@ void Reader::traverse_blocks()
                 write_packet(b + pkt->tp_mac, pkt->tp_snaplen, pkt->tp_len,
                         pkt->tp_sec, pkt->tp_nsec);
 
-                pkt = (tpacket3_hdr*)(b + pkt->tp_next_offset);
+                b += pkt->tp_next_offset;
             }
 
             // 'un-retire' bock, i.e. give it back to the kernel

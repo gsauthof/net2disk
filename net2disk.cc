@@ -348,7 +348,7 @@ static void read_tmp_files(int dfd, const std::string &tmp_dir, std::vector<std:
         struct stat st;
         ixxx::posix::fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW);
 
-        if (st.st_mode & S_IFREG == 0)
+        if (!(st.st_mode & S_IFREG))
             continue;
         v.emplace_back(e->d_name);
     }

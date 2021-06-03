@@ -43,13 +43,13 @@ ethtool -k $nic \
 ethtool -K $nic rx-all on
 
 # increase the number of slots in receive queues/rings
-ethtool -G $nic rx 4096
+ethtool -G $nic rx 4096 || true
 
 # reset to a safe value
 ethtool -X $nic equal 1
 
 # use just n receive queues
-ethtool -L $nic combined $queues
+ethtool -L $nic combined $queues || true
 
 # distribute hash-table slots over all receive queues
 ethtool -X $nic equal $queues

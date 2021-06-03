@@ -67,6 +67,7 @@ struct Args {
     Args(int argc, char **argv);
 
     std::vector<unsigned> cores;
+    unsigned sockets_per_core {1};
 
     std::string base_dir { "." };
     std::string interface;
@@ -107,6 +108,7 @@ void Args::help(std::ostream &o, const char *argv0)
         << "  -p SNAPLEN     maximum packets size to expect (default: 1522),\n"
         << "                 must fit into FRAME_SIZE\n"
         << "  -s FILE_SIZE   rotate pcap files after FILE_SIZE MiB (default: 100 MiB)\n"
+        << "  -S #SOCKETS    number of AF_PACKET sockes per reader thread (default: 1)\n"
         << "\n"
         << "2021, Georg Sauthoff <mail@gms.tf>, GPLv3+\n";
 }
@@ -117,7 +119,7 @@ Args::Args(int argc, char **argv)
     // '-' prefix: no reordering of arguments, non-option arguments are
     // returned as argument to the 1 option
     // ':': preceding option takes a mandatory argument
-    while ((c = getopt(argc, argv, "-b:c:hi:k:n:p:s:")) != -1) {
+    while ((c = getopt(argc, argv, "-b:c:hi:k:n:p:S:s:")) != -1) {
         switch (c) {
             case '?':
                 {
@@ -148,6 +150,9 @@ Args::Args(int argc, char **argv)
             case 'p':
                 snaplen = atoi(optarg);
                 break;
+            case 'S':
+                sockets_per_core = atoi(optarg);
+                break;
             case 's':
                 file_size = size_t(atoi(optarg)) << 20;
                 break;
@@ -164,7 +169,7 @@ Args::Args(int argc, char **argv)
     if (interface.empty())
         throw std::runtime_error("No interface specified (cf. -i)");
 
-    if (cores.size() > 1) {
+    if (cores.size() > 1 || sockets_per_core > 1) {
         fanout_group = getpid() & 0xffff;
         fanout_group |= PACKET_FANOUT_CPU << 16;
     }
@@ -264,7 +269,7 @@ struct Reader {
     void main();
 
     private:
-    Rx_Ring ring;
+    std::vector<Rx_Ring> rings;
 
     ixxx::util::FD tmp_dir_fd;
     ixxx::util::FD new_dir_fd;
@@ -298,8 +303,8 @@ struct Reader {
 
     void terminate();
 
-    void print_stats(int fd);
-    void print_delta_stats(int fd);
+    void print_stats(int fd, unsigned i);
+    void print_delta_stats(int fd, unsigned i);
 
     void traverse_blocks();
 
@@ -309,6 +314,7 @@ struct Reader {
 Reader::Reader(const Reader_Args &args)
     : args(args)
 {
+    rings.reserve(args.sockets_per_core);
 }
 
 int Reader::mk_packet_socket()
@@ -318,7 +324,7 @@ int Reader::mk_packet_socket()
     int version = TPACKET_V3;
     ixxx::posix::setsockopt(fd, SOL_PACKET, PACKET_VERSION, &version, sizeof version);
 
-    ring = Rx_Ring { fd, args.block_size, args.frame_size, args.blocks };
+    rings.emplace_back(fd, args.block_size, args.frame_size, args.blocks);
 
     int ts_choice = SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE;
     ixxx::posix::setsockopt(fd, SOL_PACKET, PACKET_TIMESTAMP, &ts_choice, sizeof ts_choice);
@@ -476,6 +482,7 @@ void Reader::write_packet(const unsigned char *begin, unsigned snaplen, unsigned
 
 void Reader::traverse_blocks()
 {
+    for (auto &ring : rings) {
     for (unsigned char *p : ring.block_addrs) {
         // using this as a barrier operation to create objects - like the proposed std::bless()
         // We do this such that we implicitly re-create tpacket3_hdr objects on each traverse_blocks()
@@ -525,6 +532,7 @@ void Reader::traverse_blocks()
             __atomic_store_n(&desc->hdr.bh1.block_status, TP_STATUS_KERNEL, __ATOMIC_RELEASE);
         }
     }
+    }
 }
 
 void Reader::terminate()
@@ -541,7 +549,7 @@ void Reader::terminate()
     }
 }
 
-void Reader::print_stats(int fd)
+void Reader::print_stats(int fd, unsigned i)
 {
     struct tpacket_stats_v3 stats;
     socklen_t n = sizeof stats;
@@ -553,12 +561,12 @@ void Reader::print_stats(int fd)
     drops_captured += stats.tp_drops;
     freeze_captured += stats.tp_freeze_q_cnt;
 
-    std::cout << "Reader " << args.index << " (Core "  << args.core << ") captured: "
+    std::cout << "Reader " << args.index << " (Core "  << args.core << ",Socket " << i << ") captured: "
         << bytes_captured << " bytes, "
         << pkts_captured  << " pkts, " << drops_captured << " dropped, "
         << freeze_captured << " freeze_q_cnt\n";
 }
-void Reader::print_delta_stats(int fd)
+void Reader::print_delta_stats(int fd, unsigned i)
 {
     struct tpacket_stats_v3 stats;
     socklen_t n = sizeof stats;
@@ -583,7 +591,7 @@ void Reader::print_delta_stats(int fd)
     freeze_captured += freeze;
     unsigned freeze_s = freeze / s;
 
-    std::cout << "Reader " << args.index << " (Core "  << args.core << ") captured: "
+    std::cout << "Reader " << args.index << " (Core "  << args.core << ", Socket " << i << ") captured: "
         << bytes << " bytes/s, "
         << pkts << " pkts/s, " << drops_s << " drops/s (" << drops << " per period), "
         << freeze_s << " freeze_q_cnt/s (" << freeze << " per period)\n";
@@ -608,8 +616,11 @@ void Reader::main()
         ixxx::linux::epoll_ctl(efd, EPOLL_CTL_ADD, args.efd, &ev);
     }
 
-    ixxx::util::FD fd { mk_packet_socket() };
-    {
+    std::vector<ixxx::util::FD> fds;
+    fds.reserve(args.sockets_per_core);
+    for (unsigned i = 0; i < args.sockets_per_core; ++i) {
+        fds.emplace_back(mk_packet_socket());
+        int fd = fds.back();
         struct epoll_event ev = { .events = EPOLLIN, .data = { .fd = fd } };
         ixxx::linux::epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev);
     }
@@ -657,7 +668,10 @@ void Reader::main()
             if (xd == args.efd) {
                 // we don't even have to read that eventfd because
                 // we terminate in any case ...
-                print_stats(fd);
+                unsigned i = 0;
+                for (int fd : fds) {
+                    print_stats(fd, i++);
+                }
                 terminate();
                 return;
             } else if (xd == tfd) {
@@ -666,7 +680,10 @@ void Reader::main()
                 if (l != sizeof n)
                     throw std::runtime_error("partial read from timerfd");
 
-                print_delta_stats(fd);
+                unsigned i = 0;
+                for (int fd : fds) {
+                    print_delta_stats(fd, i++);
+                }
             }
         }
     }

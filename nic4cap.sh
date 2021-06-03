@@ -40,7 +40,7 @@ ethtool -k $nic \
 
 # capture all packets, even invalid ones!
 # (certainly not available on all NICs ...)
-ethtool -K eno3 rx-all on
+ethtool -K $nic rx-all on
 
 # increase the number of slots in receive queues/rings
 ethtool -G $nic rx 4096
